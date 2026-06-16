@@ -1,0 +1,221 @@
+/**
+ * SessionManager — administra sesiones Baileys en memoria y persiste auth state
+ * en disco. Cada sesión tiene un sessionId (Guid generado por el caller),
+ * un socket Baileys (`sock`) y un último QR base64.
+ */
+
+import { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } from 'baileys';
+import { Boom } from '@hapi/boom';
+import { EventEmitter } from 'events';
+import pino from 'pino';
+import path from 'path';
+import fs from 'fs/promises';
+import { existsSync } from 'fs';
+
+const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
+
+const SESSIONS_PATH = process.env.SESSIONS_PATH || '/app/sessions';
+
+/**
+ * Resuelve un JID al teléfono crudo (solo dígitos, p.ej. "51949236969").
+ *
+ * WhatsApp emite muchos eventos con JID en formato "@lid" (Linked ID — un
+ * identificador opaco que protege la privacidad del contacto). Sin resolverlo,
+ * el backend crearía una conversación nueva por cada lid y los mensajes
+ * entrantes no se asocian a la conversación existente del usuario.
+ *
+ * Normaliza varios formatos a teléfono crudo:
+ *   "51949236969:0@s.whatsapp.net" → "51949236969"
+ *   "83129259827359@lid"           → resuelve a PN y normaliza
+ *   "51949236969"                  → "51949236969"
+ */
+async function resolveJidToPhone(sock, jid) {
+  if (!jid) return jid;
+  let target = jid;
+  if (jid.endsWith('@lid')) {
+    try {
+      const pn = await sock?.signalRepository?.lidMapping?.getPNForLID(jid);
+      if (pn) target = pn;
+    } catch (err) {
+      logger.warn({ err: err.message, jid }, 'resolveJidToPhone failed');
+    }
+  }
+  // Stripear "@dominio" y ":deviceId" — el backend guarda solo dígitos.
+  return target.split('@')[0].split(':')[0];
+}
+
+export class SessionManager {
+  constructor(onEvent) {
+    /** @type {Map<string, { sock: any; qrBase64: string | null; status: string; phoneNumber: string | null; emitter: EventEmitter; }>} */
+    this.sessions = new Map();
+    /** Callback que se llama cada vez que un evento relevante ocurre (qr, conexión, mensaje, etc.) */
+    this.onEvent = onEvent || (() => {});
+  }
+
+  async list() {
+    const items = {};
+    for (const [id, s] of this.sessions.entries()) {
+      items[id] = {
+        status:      s.status,
+        phoneNumber: s.phoneNumber,
+      };
+    }
+    return items;
+  }
+
+  has(sessionId) {
+    return this.sessions.has(sessionId);
+  }
+
+  get(sessionId) {
+    return this.sessions.get(sessionId) ?? null;
+  }
+
+  /**
+   * Crea (o reactiva) una sesión. Idempotente: si ya existe, no hace nada.
+   */
+  async create(sessionId) {
+    if (this.sessions.has(sessionId)) return this.sessions.get(sessionId);
+
+    const folder = path.join(SESSIONS_PATH, sessionId);
+    await fs.mkdir(folder, { recursive: true });
+
+    const { state, saveCreds } = await useMultiFileAuthState(folder);
+    const { version, isLatest } = await fetchLatestBaileysVersion();
+    logger.info({ sessionId, version, isLatest }, 'creating Baileys session');
+
+    const sock = makeWASocket({
+      version,
+      auth: state,
+      printQRInTerminal: false,
+      logger: pino({ level: 'silent' }),
+      browser: ['GoMessenger', 'Chrome', '1.0.0'],
+      syncFullHistory: false,
+    });
+
+    const entry = {
+      sock,
+      qrPayload: null, // payload crudo del QR (string que el frontend pinta como SVG)
+      status: 'connecting',
+      phoneNumber: null,
+      emitter: new EventEmitter(),
+    };
+    this.sessions.set(sessionId, entry);
+
+    sock.ev.on('creds.update', saveCreds);
+
+    sock.ev.on('connection.update', async (update) => {
+      const { connection, lastDisconnect, qr } = update;
+
+      if (qr) {
+        entry.qrPayload = qr;
+        entry.status = 'pending_qr';
+        logger.info({ sessionId }, 'QR generated');
+        entry.emitter.emit('qr', qr);
+        this.onEvent({ event: 'qrcode.updated', sessionId, qr });
+      }
+
+      if (connection === 'open') {
+        entry.status = 'open';
+        entry.qrPayload = null;
+        entry.phoneNumber = sock.user?.id?.split('@')[0]?.split(':')[0] ?? null;
+        logger.info({ sessionId, phone: entry.phoneNumber }, 'session connected');
+        entry.emitter.emit('connected', entry.phoneNumber);
+        this.onEvent({ event: 'session.connected', sessionId, phoneNumber: entry.phoneNumber ? `+${entry.phoneNumber}` : null });
+      }
+
+      if (connection === 'close') {
+        const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode;
+        const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+        entry.status = shouldReconnect ? 'connecting' : 'close';
+        logger.warn({ sessionId, statusCode, shouldReconnect }, 'session disconnected');
+        entry.emitter.emit('disconnected');
+        this.onEvent({ event: 'session.disconnected', sessionId });
+
+        if (shouldReconnect) {
+          // Recrear el socket. La auth state ya está persistida.
+          this.sessions.delete(sessionId);
+          setTimeout(() => this.create(sessionId).catch((err) => logger.error({ err, sessionId }, 'reconnect failed')), 2000);
+        }
+      }
+    });
+
+    sock.ev.on('messages.upsert', async ({ messages, type }) => {
+      try {
+        if (type !== 'notify') return;
+        for (const msg of messages) {
+          if (msg.key.fromMe) continue;
+          const rawFrom = msg.key.remoteJid;
+          if (rawFrom === 'status@broadcast') continue;
+
+          const from = await resolveJidToPhone(sock, rawFrom);
+
+          const text = msg.message?.conversation
+                    ?? msg.message?.extendedTextMessage?.text
+                    ?? msg.message?.imageMessage?.caption
+                    ?? msg.message?.videoMessage?.caption
+                    ?? null;
+          const mediaType = msg.message?.imageMessage    ? 'image'
+                          : msg.message?.videoMessage    ? 'video'
+                          : msg.message?.audioMessage    ? 'audio'
+                          : msg.message?.documentMessage ? 'document'
+                          : null;
+
+          // El backend espera el detalle del mensaje en payload.Message; los
+          // campos top-level se conservan por compatibilidad con consumidores
+          // del formato antiguo.
+          this.onEvent({
+            event:     'message.received',
+            sessionId,
+            messageId: msg.key.id,
+            message: {
+              messageId: msg.key.id,
+              from,
+              body:      text ?? '',
+              mediaUrl:  null,
+              mediaType,
+            },
+            from,
+            fromMe:    false,
+            body:      text,
+            mediaType,
+            timestamp: Number(msg.messageTimestamp) || Math.floor(Date.now() / 1000),
+          });
+        }
+      } catch (err) {
+        logger.error({ err: err.message, sessionId }, 'messages.upsert handler failed');
+      }
+    });
+
+    return entry;
+  }
+
+  async delete(sessionId) {
+    const entry = this.sessions.get(sessionId);
+    if (entry) {
+      try { await entry.sock.logout(); } catch { /* ignore */ }
+      try { entry.sock.end(); } catch { /* ignore */ }
+      this.sessions.delete(sessionId);
+    }
+    const folder = path.join(SESSIONS_PATH, sessionId);
+    if (existsSync(folder)) {
+      await fs.rm(folder, { recursive: true, force: true });
+    }
+  }
+
+  /**
+   * Al iniciar el server, restauramos sesiones que tengan creds persistidas en disco.
+   */
+  async restore() {
+    if (!existsSync(SESSIONS_PATH)) return;
+    const ids = await fs.readdir(SESSIONS_PATH);
+    for (const id of ids) {
+      const credsPath = path.join(SESSIONS_PATH, id, 'creds.json');
+      if (existsSync(credsPath)) {
+        logger.info({ sessionId: id }, 'restoring session');
+        try { await this.create(id); }
+        catch (err) { logger.error({ err, sessionId: id }, 'restore failed'); }
+      }
+    }
+  }
+}
