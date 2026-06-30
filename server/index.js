@@ -13,6 +13,12 @@
  *   POST   /sessions/:id/send                        — enviar mensaje (texto / media)
  *   POST   /sessions/:id/contacts/check              — verificar contactos
  *
+ *   GET    /sessions/:id/profile-picture-url        — URL pública de la foto actual
+ *   PUT    /sessions/:id/profile-picture             — cambiar foto de perfil (base64 jpeg)
+ *   DELETE /sessions/:id/profile-picture             — eliminar foto de perfil
+ *   GET    /sessions/:id/profile-name                — push name actual
+ *   PUT    /sessions/:id/profile-name                — cambiar nombre comercial / push name
+ *
  *   GET    /sessions/:id/groups                      — listar grupos del usuario
  *   POST   /sessions/:id/groups                      — crear grupo
  *   GET    /sessions/:id/groups/:jid                 — metadata del grupo
@@ -35,7 +41,12 @@ import { WebhookDispatcher } from './webhook.js';
 
 const PORT             = Number(process.env.PORT || 3001);
 const INTERNAL_SECRET  = process.env.INTERNAL_SECRET || '';
-const fastify = Fastify({ logger: { level: process.env.LOG_LEVEL || 'info' } });
+// bodyLimit 6 MB: el endpoint /profile-picture acepta base64 hasta 4 MB de
+// imagen cruda (≈ 5.4 MB tras encode); el default de 1 MB rechazaba el upload.
+const fastify = Fastify({
+  logger:    { level: process.env.LOG_LEVEL || 'info' },
+  bodyLimit: 6 * 1024 * 1024,
+});
 
 const webhook = new WebhookDispatcher();
 const sessions = new SessionManager((event) => webhook.dispatch(event));
@@ -165,6 +176,129 @@ fastify.post('/api/sessions/:id/contacts/check', async (req, reply) => {
     return { results: results.map((r) => ({ jid: r.jid, exists: r.exists })) };
   } catch (err) {
     fastify.log.error({ err }, 'contacts check failed');
+    return reply.code(500).send({ error: err.message });
+  }
+});
+
+// ─── Perfil ───────────────────────────────────────────────────────────────────
+// Endpoints para administrar el perfil del WhatsApp Business asociado a la
+// sesión (foto y nombre comercial visible en el chat).
+
+/**
+ * Devuelve la URL pública (CDN de WhatsApp) de la foto de perfil actual del
+ * número conectado. `null` si el usuario no tiene foto. Devuelve la versión
+ * `image` (alta resolución) en lugar de `preview` (chica) porque la usamos
+ * para previsualizar en el panel admin, no en chats.
+ */
+fastify.get('/api/sessions/:id/profile-picture-url', async (req, reply) => {
+  const entry = sessions.get(req.params.id);
+  if (!entry) return reply.code(404).send({ error: 'session_not_found' });
+  if (entry.status !== 'open') return reply.code(400).send({ error: 'session_not_connected', status: entry.status });
+
+  try {
+    const myJid = entry.sock.user?.id;
+    if (!myJid) return reply.code(500).send({ error: 'session_not_authenticated' });
+    const url = await entry.sock.profilePictureUrl(myJid, 'image').catch(() => null);
+    return { url: url ?? null };
+  } catch (err) {
+    fastify.log.error({ err, sessionId: req.params.id }, 'get profile picture url failed');
+    return reply.code(500).send({ error: err.message });
+  }
+});
+
+/**
+ * Devuelve el push name (nombre comercial) actual del WhatsApp Business.
+ * Lee directamente del estado autenticado de la sesión Baileys.
+ */
+fastify.get('/api/sessions/:id/profile-name', async (req, reply) => {
+  const entry = sessions.get(req.params.id);
+  if (!entry) return reply.code(404).send({ error: 'session_not_found' });
+  if (entry.status !== 'open') return reply.code(400).send({ error: 'session_not_connected', status: entry.status });
+
+  try {
+    const name = entry.sock.user?.name ?? null;
+    return { name };
+  } catch (err) {
+    fastify.log.error({ err, sessionId: req.params.id }, 'get profile name failed');
+    return reply.code(500).send({ error: err.message });
+  }
+});
+
+/** Decodifica un base64 (con o sin prefijo data: URL) a Buffer. */
+function decodeBase64Image(raw) {
+  if (!raw || typeof raw !== 'string') return null;
+  const cleaned = raw.startsWith('data:') ? raw.replace(/^data:[^;]+;base64,/, '') : raw;
+  try { return Buffer.from(cleaned, 'base64'); } catch { return null; }
+}
+
+/**
+ * Cambia la foto de perfil del WhatsApp Business asociado a la sesión.
+ * Body: `{ image: '<base64 jpeg/png>' }` (con o sin prefijo data:URL).
+ * La imagen debe ser cuadrada — el cropper del frontend ya se encarga.
+ * WhatsApp internamente la convierte a JPEG ~640x640.
+ */
+fastify.put('/api/sessions/:id/profile-picture', async (req, reply) => {
+  const entry = sessions.get(req.params.id);
+  if (!entry) return reply.code(404).send({ error: 'session_not_found' });
+  if (entry.status !== 'open') return reply.code(400).send({ error: 'session_not_connected', status: entry.status });
+
+  const buffer = decodeBase64Image(req.body?.image);
+  if (!buffer) return reply.code(400).send({ error: 'image (base64) required' });
+  // Límite duro: 4 MB. WhatsApp acepta ~5 MB, dejamos margen.
+  if (buffer.length > 4 * 1024 * 1024) {
+    return reply.code(413).send({ error: 'image_too_large', maxBytes: 4 * 1024 * 1024 });
+  }
+
+  try {
+    const myJid = entry.sock.user?.id;
+    if (!myJid) return reply.code(500).send({ error: 'session_not_authenticated' });
+    await entry.sock.updateProfilePicture(myJid, buffer);
+    return { ok: true };
+  } catch (err) {
+    fastify.log.error({ err, sessionId: req.params.id }, 'update profile picture failed');
+    return reply.code(500).send({ error: err.message });
+  }
+});
+
+/** Elimina la foto de perfil del WhatsApp Business. */
+fastify.delete('/api/sessions/:id/profile-picture', async (req, reply) => {
+  const entry = sessions.get(req.params.id);
+  if (!entry) return reply.code(404).send({ error: 'session_not_found' });
+  if (entry.status !== 'open') return reply.code(400).send({ error: 'session_not_connected', status: entry.status });
+
+  try {
+    const myJid = entry.sock.user?.id;
+    if (!myJid) return reply.code(500).send({ error: 'session_not_authenticated' });
+    await entry.sock.removeProfilePicture(myJid);
+    return { ok: true };
+  } catch (err) {
+    fastify.log.error({ err, sessionId: req.params.id }, 'remove profile picture failed');
+    return reply.code(500).send({ error: err.message });
+  }
+});
+
+/**
+ * Cambia el push name (nombre visible en chats) del WhatsApp Business.
+ * Body: `{ name: 'Mi Negocio' }`.
+ */
+fastify.put('/api/sessions/:id/profile-name', async (req, reply) => {
+  const entry = sessions.get(req.params.id);
+  if (!entry) return reply.code(404).send({ error: 'session_not_found' });
+  if (entry.status !== 'open') return reply.code(400).send({ error: 'session_not_connected', status: entry.status });
+
+  const { name } = req.body || {};
+  if (!name || typeof name !== 'string' || !name.trim()) {
+    return reply.code(400).send({ error: 'name required' });
+  }
+  if (name.length > 100) {
+    return reply.code(400).send({ error: 'name_too_long', max: 100 });
+  }
+
+  try {
+    await entry.sock.updateProfileName(name.trim());
+    return { ok: true };
+  } catch (err) {
+    fastify.log.error({ err, sessionId: req.params.id }, 'update profile name failed');
     return reply.code(500).send({ error: err.message });
   }
 });
