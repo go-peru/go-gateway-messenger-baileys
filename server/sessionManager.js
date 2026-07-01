@@ -161,6 +161,11 @@ export class SessionManager {
                           : msg.message?.documentMessage ? 'document'
                           : null;
 
+          // pushName es el nombre público que el contacto configuró en su
+          // perfil de WhatsApp. Puede ser null si el usuario no tiene nombre
+          // configurado o si el mensaje viene sin metadata.
+          const pushName = msg.pushName ?? null;
+
           // El backend espera el detalle del mensaje en payload.Message; los
           // campos top-level se conservan por compatibilidad con consumidores
           // del formato antiguo.
@@ -171,11 +176,13 @@ export class SessionManager {
             message: {
               messageId: msg.key.id,
               from,
+              pushName,
               body:      text ?? '',
               mediaUrl:  null,
               mediaType,
             },
             from,
+            pushName,
             fromMe:    false,
             body:      text,
             mediaType,
