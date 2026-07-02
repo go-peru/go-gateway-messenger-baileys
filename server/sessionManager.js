@@ -142,7 +142,11 @@ export class SessionManager {
 
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
       try {
-        if (type !== 'notify') return;
+        // Los mensajes salientes desde el celular llegan con type='append'
+        // (Baileys no los notifica como 'notify'). Aceptamos ambos: el filtro
+        // real por contenido util (texto/media) esta mas abajo y descarta
+        // ACKs y receipts.
+        if (type !== 'notify' && type !== 'append') return;
         for (const msg of messages) {
           const rawFrom = msg.key.remoteJid;
           if (rawFrom === 'status@broadcast') continue;
