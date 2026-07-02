@@ -144,11 +144,26 @@ export class SessionManager {
       try {
         if (type !== 'notify') return;
         for (const msg of messages) {
-          if (msg.key.fromMe) continue;
           const rawFrom = msg.key.remoteJid;
           if (rawFrom === 'status@broadcast') continue;
 
-          const from = await resolveJidToPhone(sock, rawFrom);
+          // Solo procesamos mensajes con contenido útil (texto o media).
+          // Los ACKs / receipts pasan por acá también y no aportan.
+          const hasContent =
+            msg.message?.conversation !== undefined ||
+            msg.message?.extendedTextMessage !== undefined ||
+            msg.message?.imageMessage !== undefined ||
+            msg.message?.videoMessage !== undefined ||
+            msg.message?.audioMessage !== undefined ||
+            msg.message?.documentMessage !== undefined;
+          if (!hasContent) continue;
+
+          const isFromMe = !!msg.key.fromMe;
+          // remoteJid siempre identifica al CONTACTO, sea el emisor
+          // (fromMe=false) o el destinatario (fromMe=true). Así la
+          // conversación se resuelve por el mismo par (sesión, contactPhone)
+          // en ambos casos.
+          const contactPhone = await resolveJidToPhone(sock, rawFrom);
 
           const text = msg.message?.conversation
                     ?? msg.message?.extendedTextMessage?.text
@@ -162,28 +177,29 @@ export class SessionManager {
                           : null;
 
           // pushName es el nombre público que el contacto configuró en su
-          // perfil de WhatsApp. Puede ser null si el usuario no tiene nombre
-          // configurado o si el mensaje viene sin metadata.
-          const pushName = msg.pushName ?? null;
+          // perfil de WhatsApp. Solo válido para inbound (fromMe=false):
+          // cuando somos nosotros los que mandamos, no hay pushName del
+          // contacto en la clave.
+          const pushName = isFromMe ? null : (msg.pushName ?? null);
 
-          // El backend espera el detalle del mensaje en payload.Message; los
-          // campos top-level se conservan por compatibilidad con consumidores
-          // del formato antiguo.
+          // Emitimos un evento distintivo para los mensajes fromMe: el
+          // backend los persiste como Outbound con sent_externally=true
+          // y los reenvía al webhook con `event: message.sent_externally`.
           this.onEvent({
-            event:     'message.received',
+            event:     isFromMe ? 'message.sent_externally' : 'message.received',
             sessionId,
             messageId: msg.key.id,
             message: {
               messageId: msg.key.id,
-              from,
+              from:      contactPhone,
               pushName,
               body:      text ?? '',
               mediaUrl:  null,
               mediaType,
             },
-            from,
+            from:      contactPhone,
             pushName,
-            fromMe:    false,
+            fromMe:    isFromMe,
             body:      text,
             mediaType,
             timestamp: Number(msg.messageTimestamp) || Math.floor(Date.now() / 1000),
