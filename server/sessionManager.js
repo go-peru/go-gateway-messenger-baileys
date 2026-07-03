@@ -65,14 +65,20 @@ async function tryDownloadMedia(sock, msg, mediaType) {
     if (!buffer || buffer.length === 0) return null;
 
     // Extraemos metadatos del nodo específico (imageMessage, audioMessage, etc).
+    // Los stickers de WhatsApp llegan como stickerMessage (image/webp) y los
+    // tratamos como image — el frontend detecta el mime y los muestra flotantes
+    // sin borde como corresponde.
     const node =
       msg.message?.imageMessage    ??
       msg.message?.videoMessage    ??
       msg.message?.audioMessage    ??
-      msg.message?.documentMessage;
+      msg.message?.documentMessage ??
+      msg.message?.stickerMessage;
     const mimeType = node?.mimetype ?? null;
-    // documentMessage.fileName solo aplica a documentos.
-    const filename = msg.message?.documentMessage?.fileName ?? null;
+    // documentMessage.fileName solo aplica a documentos. Los stickers no traen
+    // filename — le damos uno derivado del extension del mime.
+    const filename = msg.message?.documentMessage?.fileName
+      ?? (msg.message?.stickerMessage ? `sticker.webp` : null);
     // audioMessage.seconds y videoMessage.seconds son la duración cuando existe.
     const durationSec = node?.seconds ?? null;
     // imageMessage/videoMessage traen width/height del CDN de WA.
@@ -210,8 +216,20 @@ export class SessionManager {
             msg.message?.imageMessage !== undefined ||
             msg.message?.videoMessage !== undefined ||
             msg.message?.audioMessage !== undefined ||
-            msg.message?.documentMessage !== undefined;
+            msg.message?.documentMessage !== undefined ||
+            msg.message?.stickerMessage !== undefined;
           if (!hasContent) continue;
+
+          // ── Instrumentación de latencia (temporal, para diagnóstico) ──
+          // t0 = ahora (evento entrante en baileys node)
+          // t_wa = timestamp del mensaje WhatsApp (msg.messageTimestamp)
+          // Loggeamos ambos para ver: (a) cuánto tarda desde que el cliente
+          // envía hasta que baileys lo procesa, (b) qué type='' del upsert
+          // (notify vs append), y (c) más abajo, cuánto tarda la descarga
+          // de media.
+          const t0 = Date.now();
+          const waTsSec = Number(msg.messageTimestamp) || 0;
+          const waLagMs = waTsSec > 0 ? (t0 - waTsSec * 1000) : null;
 
           const isFromMe = !!msg.key.fromMe;
           // remoteJid siempre identifica al CONTACTO, sea el emisor
@@ -225,10 +243,14 @@ export class SessionManager {
                     ?? msg.message?.imageMessage?.caption
                     ?? msg.message?.videoMessage?.caption
                     ?? null;
+          // Los stickers se tratan como image en el wire — llevan mime
+          // image/webp y el frontend los reconoce ahí para mostrar
+          // flotantes sin borde, como corresponde a un sticker.
           const mediaType = msg.message?.imageMessage    ? 'image'
                           : msg.message?.videoMessage    ? 'video'
                           : msg.message?.audioMessage    ? 'audio'
                           : msg.message?.documentMessage ? 'document'
+                          : msg.message?.stickerMessage  ? 'image'
                           : null;
 
           // Cuando hay media, descargamos el buffer y lo mandamos base64
@@ -236,7 +258,24 @@ export class SessionManager {
           // pública que se persiste en la BD.
           //
           // Devuelve null si el mensaje no es media o falla la descarga.
+          const tBeforeMedia = Date.now();
           const mediaPayload = await tryDownloadMedia(sock, msg, mediaType);
+          const mediaMs = Date.now() - tBeforeMedia;
+
+          // Log de latencia acumulada para este mensaje. Nos permite ver
+          // cuál tramo tarda:
+          //   - waLagMs: cuánto se demoró desde que el cliente envió hasta
+          //     que baileys node recibió el evento (red WhatsApp + baileys)
+          //   - upsertType: notify (mensaje nuevo) vs append (backfill)
+          //   - mediaMs: descarga del CDN si aplica
+          logger.info({
+            event: 'msg_pipeline',
+            waLagMs,
+            upsertType: type,
+            mediaMs: mediaType ? mediaMs : null,
+            mediaType,
+            fromMe: !!msg.key.fromMe,
+          }, 'inbound_timing');
 
           // pushName es el nombre público que el contacto configuró en su
           // perfil de WhatsApp. Solo válido para inbound (fromMe=false):
