@@ -4,7 +4,7 @@
  * un socket Baileys (`sock`) y un último QR base64.
  */
 
-import { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } from 'baileys';
+import { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, downloadMediaMessage } from 'baileys';
 import { Boom } from '@hapi/boom';
 import { EventEmitter } from 'events';
 import pino from 'pino';
@@ -42,6 +42,57 @@ async function resolveJidToPhone(sock, jid) {
   }
   // Stripear "@dominio" y ":deviceId" — el backend guarda solo dígitos.
   return target.split('@')[0].split(':')[0];
+}
+
+/**
+ * Descarga el buffer de la media del mensaje y lo empaqueta como base64
+ * con sus metadatos. Devuelve null si:
+ *   - El mensaje no tiene media (mediaType es null).
+ *   - La descarga falla (media expirada en el CDN de WhatsApp, sin permisos, etc).
+ *
+ * Los metadatos (mimeType, filename, durationSec, dimensions) son opcionales —
+ * los pasamos como los tenga el mensaje para que gomessenger arme el content-type
+ * correcto en MinIO y el frontend renderice el widget adecuado.
+ */
+async function tryDownloadMedia(sock, msg, mediaType) {
+  if (!mediaType) return null;
+
+  try {
+    const buffer = await downloadMediaMessage(msg, 'buffer', {}, {
+      logger,
+      reuploadRequest: sock.updateMediaMessage,
+    });
+    if (!buffer || buffer.length === 0) return null;
+
+    // Extraemos metadatos del nodo específico (imageMessage, audioMessage, etc).
+    const node =
+      msg.message?.imageMessage    ??
+      msg.message?.videoMessage    ??
+      msg.message?.audioMessage    ??
+      msg.message?.documentMessage;
+    const mimeType = node?.mimetype ?? null;
+    // documentMessage.fileName solo aplica a documentos.
+    const filename = msg.message?.documentMessage?.fileName ?? null;
+    // audioMessage.seconds y videoMessage.seconds son la duración cuando existe.
+    const durationSec = node?.seconds ?? null;
+    // imageMessage/videoMessage traen width/height del CDN de WA.
+    const width  = node?.width  ?? null;
+    const height = node?.height ?? null;
+
+    return {
+      type:        mediaType,           // image | video | audio | document
+      base64:      buffer.toString('base64'),
+      byteLength:  buffer.length,
+      mimeType,
+      filename,
+      durationSec,
+      width,
+      height,
+    };
+  } catch (err) {
+    logger.warn({ err: err.message, mediaType, msgId: msg.key.id }, 'downloadMediaMessage failed');
+    return null;
+  }
 }
 
 export class SessionManager {
@@ -180,6 +231,13 @@ export class SessionManager {
                           : msg.message?.documentMessage ? 'document'
                           : null;
 
+          // Cuando hay media, descargamos el buffer y lo mandamos base64
+          // al backend. Gomessenger lo sube a MinIO y devuelve la URL
+          // pública que se persiste en la BD.
+          //
+          // Devuelve null si el mensaje no es media o falla la descarga.
+          const mediaPayload = await tryDownloadMedia(sock, msg, mediaType);
+
           // pushName es el nombre público que el contacto configuró en su
           // perfil de WhatsApp. Solo válido para inbound (fromMe=false):
           // cuando somos nosotros los que mandamos, no hay pushName del
@@ -200,12 +258,16 @@ export class SessionManager {
               body:      text ?? '',
               mediaUrl:  null,
               mediaType,
+              // Base64 + metadatos cuando hay media. Gomessenger los sube
+              // a MinIO y persiste la URL pública en lugar del base64.
+              media:     mediaPayload,
             },
             from:      contactPhone,
             pushName,
             fromMe:    isFromMe,
             body:      text,
             mediaType,
+            media:     mediaPayload,
             timestamp: Number(msg.messageTimestamp) || Math.floor(Date.now() / 1000),
           });
         }
