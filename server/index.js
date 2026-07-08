@@ -10,6 +10,7 @@
  *   GET    /sessions/:id/status                      — estado actual
  *   GET    /sessions/:id/qr                          — QR (base64 data URL) si existe
  *   DELETE /sessions/:id                             — borrar sesión
+ *   POST   /sessions/:id/ping                        — round-trip real contra WA (para watchdog zombie)
  *   POST   /sessions/:id/send                        — enviar mensaje (texto / media)
  *   POST   /sessions/:id/contacts/check              — verificar contactos
  *
@@ -132,6 +133,25 @@ fastify.get('/api/sessions/:id/qr', async (req, reply) => {
 fastify.delete('/api/sessions/:id', async (req, reply) => {
   await sessions.delete(req.params.id);
   return reply.code(204).send();
+});
+
+/**
+ * Ping activo del socket contra WhatsApp — round-trip real, no keepalive TCP.
+ *
+ * El watchdog de sesiones zombie del backend usa este endpoint para confirmar
+ * que una sesión que reporta `status='open'` pero lleva N min sin recibir
+ * inbound realmente tiene el socket vivo. El keepalive WebSocket de Baileys
+ * responde OK cuando el socket está en zombie post-suspend, así que no sirve.
+ *
+ * `200 { pong: true, roundTripMs }`  → socket vivo, no tocar.
+ * `503 { pong: false, reason }`      → zombie confirmado, recrear sesión.
+ */
+fastify.post('/api/sessions/:id/ping', async (req, reply) => {
+  const timeoutMs = Number(req.body?.timeout_ms) || 10_000;
+  const result = await sessions.ping(req.params.id, timeoutMs);
+  if (result.reason === 'session_not_found') return reply.code(404).send(result);
+  if (!result.pong) return reply.code(503).send(result);
+  return result;
 });
 
 // ─── Envío de mensajes (texto y media) ────────────────────────────────────────
