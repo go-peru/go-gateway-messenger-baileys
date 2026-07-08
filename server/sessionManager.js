@@ -208,39 +208,6 @@ export class SessionManager {
           const rawFrom = msg.key.remoteJid;
           if (rawFrom === 'status@broadcast') continue;
 
-          // ── Reacciones (emoji del cliente sobre un mensaje) ─────────────
-          // Baileys expone las reacciones como `message.reactionMessage`.
-          // Estructura:
-          //   reactionMessage: {
-          //     key: { id, remoteJid, fromMe, ... },  // ← ID del mensaje reaccionado
-          //     text: '👍',                            // ← emoji (empty string = remover)
-          //     senderTimestampMs: 1725...
-          //   }
-          // Solo emitimos reacciones del contacto (no fromMe). Las de nuestro
-          // celular no las persistimos en esta iteración (scope unidireccional).
-          if (msg.message?.reactionMessage !== undefined) {
-            const isFromMeReaction = !!msg.key.fromMe;
-            if (isFromMeReaction) continue;
-
-            const reaction = msg.message.reactionMessage;
-            const targetMessageId = reaction?.key?.id ?? null;
-            if (!targetMessageId) continue;
-
-            const reactorPhone = await resolveJidToPhone(sock, rawFrom);
-            const emoji = typeof reaction.text === 'string' ? reaction.text : '';
-            const ts = Number(msg.messageTimestamp) || Math.floor(Date.now() / 1000);
-
-            this.onEvent({
-              event:           'message.reaction',
-              sessionId,
-              from:            reactorPhone,
-              targetMessageId,
-              emoji,
-              timestamp:       ts,
-            });
-            continue;
-          }
-
           // Solo procesamos mensajes con contenido útil (texto o media).
           // Los ACKs / receipts pasan por acá también y no aportan.
           const hasContent =
@@ -349,49 +316,6 @@ export class SessionManager {
     });
 
     return entry;
-  }
-
-  /**
-   * Verifica que el socket esté vivo de verdad haciendo un round-trip real
-   * contra el servidor de WhatsApp — no solo comprobar `status === 'open'`.
-   *
-   * El zombie post-suspend en Docker Desktop Windows deja el socket TCP
-   * conectado y `sock.ws.isOpen` en true, pero WhatsApp ya descartó el estado
-   * aplicativo. El keepalive WebSocket (ping/pong de bajo nivel) pasa igual
-   * porque va debajo de la capa aplicativa. La única señal fiable es forzar
-   * una interacción bidireccional a nivel Noise/protobuf.
-   *
-   * Usamos `sendPresenceUpdate('available')` porque:
-   *   - Es cheap (no genera notificación al peer, solo actualiza server-side).
-   *   - Falla / cuelga si el socket está zombie.
-   *   - No requiere manejar respuesta específica (es fire-and-forget con ack).
-   *
-   * Devuelve `{ pong: true, roundTripMs }` si el envío se resolvió antes del
-   * timeout, o `{ pong: false, reason }` si falló / expiró.
-   */
-  async ping(sessionId, timeoutMs = 10_000) {
-    const entry = this.sessions.get(sessionId);
-    if (!entry) return { pong: false, reason: 'session_not_found' };
-    if (entry.status !== 'open') return { pong: false, reason: 'session_not_open', status: entry.status };
-
-    const t0 = Date.now();
-    let timer;
-    try {
-      const timeoutPromise = new Promise((_, reject) => {
-        timer = setTimeout(() => reject(new Error('timeout')), timeoutMs);
-      });
-      await Promise.race([
-        entry.sock.sendPresenceUpdate('available'),
-        timeoutPromise,
-      ]);
-      return { pong: true, roundTripMs: Date.now() - t0 };
-    } catch (err) {
-      const reason = err.message === 'timeout' ? 'timeout' : (err.message || 'send_failed');
-      logger.warn({ sessionId, reason, elapsedMs: Date.now() - t0 }, 'session ping failed');
-      return { pong: false, reason, elapsedMs: Date.now() - t0 };
-    } finally {
-      if (timer) clearTimeout(timer);
-    }
   }
 
   async delete(sessionId) {
